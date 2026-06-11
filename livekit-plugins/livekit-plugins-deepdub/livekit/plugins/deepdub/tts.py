@@ -49,6 +49,12 @@ SUPPORTED_SAMPLE_RATES = (8000, 16000, 22050, 24000, 44100, 48000)
 # prepends when format is "wav"
 AUDIO_FORMAT = "s16le"
 
+# the streaming endpoint may split the input into several generations, each ending
+# with its own isFinished message, and sends nothing after the last one; once input
+# is closed and a generation finished, wait this long for another generation to
+# start before treating the stream as complete
+STREAM_END_GRACE = 1.0
+
 
 @dataclass
 class _TTSOptions:
@@ -315,7 +321,8 @@ class ChunkedStream(tts.ChunkedStream):
                         body=f"{msg.data=} {msg.extra=}",
                     )
 
-                if msg.type != aiohttp.WSMsgType.TEXT:
+                # audio messages are JSON delivered in binary frames
+                if msg.type not in (aiohttp.WSMsgType.TEXT, aiohttp.WSMsgType.BINARY):
                     logger.warning("unexpected Deepdub message type %s", msg.type)
                     continue
 
@@ -385,9 +392,21 @@ class SynthesizeStream(tts.SynthesizeStream):
 
         async def _recv_task(ws: aiohttp.ClientWebSocketResponse) -> None:
             segment_started = False
+            generation_finished = False
             await input_sent_event.wait()
             while True:
-                msg = await ws.receive(timeout=self._conn_options.timeout)
+                try:
+                    timeout = (
+                        STREAM_END_GRACE
+                        if generation_finished and input_ended.is_set()
+                        else self._conn_options.timeout
+                    )
+                    msg = await ws.receive(timeout=timeout)
+                except asyncio.TimeoutError:
+                    if generation_finished and input_ended.is_set():
+                        output_emitter.end_input()
+                        return
+                    raise
                 if msg.type in (
                     aiohttp.WSMsgType.CLOSED,
                     aiohttp.WSMsgType.CLOSE,
@@ -400,7 +419,8 @@ class SynthesizeStream(tts.SynthesizeStream):
                         body=f"{msg.data=} {msg.extra=}",
                     )
 
-                if msg.type != aiohttp.WSMsgType.TEXT:
+                # audio messages are JSON delivered in binary frames
+                if msg.type not in (aiohttp.WSMsgType.TEXT, aiohttp.WSMsgType.BINARY):
                     logger.warning("unexpected Deepdub message type %s", msg.type)
                     continue
 
@@ -416,16 +436,14 @@ class SynthesizeStream(tts.SynthesizeStream):
                     raise APIError(f"Deepdub returned error: {data}")
 
                 if data.get("data"):
+                    generation_finished = False
                     if not segment_started:
                         segment_started = True
                         output_emitter.start_segment(segment_id=request_id)
                     output_emitter.push(base64.b64decode(data["data"]))
 
-                # once input is closed, the generation is complete when the server
-                # reports isFinished or sends a terminal message without audio
-                if input_ended.is_set() and (data.get("isFinished") or not data.get("data")):
-                    output_emitter.end_input()
-                    break
+                if data.get("isFinished"):
+                    generation_finished = True
 
         ws: aiohttp.ClientWebSocketResponse | None = None
         try:
@@ -433,7 +451,7 @@ class SynthesizeStream(tts.SynthesizeStream):
 
             # the server sends an initial status message before accepting configuration
             initial_msg = await ws.receive(timeout=self._conn_options.timeout)
-            if initial_msg.type != aiohttp.WSMsgType.TEXT:
+            if initial_msg.type not in (aiohttp.WSMsgType.TEXT, aiohttp.WSMsgType.BINARY):
                 raise APIStatusError(
                     "Deepdub connection closed before the initial status message",
                     request_id=request_id,
