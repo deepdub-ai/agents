@@ -93,7 +93,7 @@ class TTS(tts.TTS):
         self,
         *,
         api_key: str | None = None,
-        model: TTSModels | str = "dd-etts-3.0",
+        model: TTSModels | str = "dd-etts-3.3",
         locale: str = "en-US",
         voice_prompt_id: str = TTSDefaultVoiceId,
         sample_rate: int = 24000,
@@ -121,7 +121,7 @@ class TTS(tts.TTS):
         Args:
             api_key (str, optional): The Deepdub API key. If not provided, it will be read from
                 the DEEPDUB_API_KEY environment variable.
-            model (TTSModels, optional): The Deepdub TTS model to use. Defaults to "dd-etts-3.0".
+            model (TTSModels, optional): The Deepdub TTS model to use. Defaults to "dd-etts-3.3".
             locale (str, optional): The locale for synthesis, e.g. "en-US". Defaults to "en-US".
             voice_prompt_id (str, optional): The Deepdub voice prompt ID.
             sample_rate (int, optional): The audio sample rate in Hz. Defaults to 24000.
