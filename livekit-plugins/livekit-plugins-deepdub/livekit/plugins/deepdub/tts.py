@@ -66,6 +66,7 @@ class _TTSOptions:
     variance: float | None
     tempo: float | None
     prompt_boost: bool
+    realtime: bool
     accept_emojis: bool
     accent_base_locale: str | None
     accent_locale: str | None
@@ -101,6 +102,7 @@ class TTS(tts.TTS):
         variance: float | None = None,
         tempo: float | None = None,
         prompt_boost: bool = False,
+        realtime: bool = True,
         accept_emojis: bool = False,
         accent_base_locale: str | None = None,
         accent_locale: str | None = None,
@@ -129,6 +131,8 @@ class TTS(tts.TTS):
             variance (float, optional): Expressivity variance, between 0.0 and 1.0.
             tempo (float, optional): Speed of speech, between 0.5 and 2.0.
             prompt_boost (bool, optional): Enhance similarity to the voice prompt.
+            realtime (bool, optional): Request real-time generation priority for lower latency.
+                Defaults to True, which suits live voice agents.
             accept_emojis (bool, optional): Whether emojis in the streamed text are voiced.
                 Only applies to ``stream()``.
             accent_base_locale (str, optional): Base locale for accent control, e.g. "en-US".
@@ -174,6 +178,7 @@ class TTS(tts.TTS):
             variance=variance,
             tempo=tempo,
             prompt_boost=prompt_boost,
+            realtime=realtime,
             accept_emojis=accept_emojis,
             accent_base_locale=accent_base_locale,
             accent_locale=accent_locale,
@@ -218,6 +223,7 @@ class TTS(tts.TTS):
         variance: NotGivenOr[float | None] = NOT_GIVEN,
         tempo: NotGivenOr[float | None] = NOT_GIVEN,
         prompt_boost: NotGivenOr[bool] = NOT_GIVEN,
+        realtime: NotGivenOr[bool] = NOT_GIVEN,
     ) -> None:
         """
         Update the Text-to-Speech (TTS) configuration options.
@@ -234,6 +240,7 @@ class TTS(tts.TTS):
             variance (float, optional): Expressivity variance, between 0.0 and 1.0.
             tempo (float, optional): Speed of speech, between 0.5 and 2.0.
             prompt_boost (bool, optional): Enhance similarity to the voice prompt.
+            realtime (bool, optional): Request real-time generation priority for lower latency.
         """
         if is_given(model):
             self._opts.model = model
@@ -249,6 +256,8 @@ class TTS(tts.TTS):
             self._opts.tempo = tempo
         if is_given(prompt_boost):
             self._opts.prompt_boost = prompt_boost
+        if is_given(realtime):
+            self._opts.realtime = realtime
 
     def synthesize(
         self, text: str, *, conn_options: APIConnectOptions = DEFAULT_API_CONNECT_OPTIONS
@@ -290,6 +299,7 @@ class ChunkedStream(tts.ChunkedStream):
             "variance": self._opts.variance,
             "tempo": self._opts.tempo,
             "promptBoost": self._opts.prompt_boost,
+            "realtime": self._opts.realtime,
             "accentControl": self._opts.accent_control(),
             "format": AUDIO_FORMAT,
             "sampleRate": self._opts.sample_rate,
@@ -481,6 +491,7 @@ class SynthesizeStream(tts.SynthesizeStream):
                     "variance": self._opts.variance,
                     "tempo": self._opts.tempo,
                     "promptBoost": self._opts.prompt_boost,
+                    "realtime": self._opts.realtime,
                     "accentControl": self._opts.accent_control(),
                 },
             }
