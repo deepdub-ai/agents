@@ -57,6 +57,7 @@ class _StreamConn:
     def __init__(self, cm: Any, conn: DeepdubClient) -> None:
         self._cm = cm
         self.conn = conn
+        self._watcher: asyncio.Task[None] | None = None
 
     async def aclose(self) -> None:
         with contextlib.suppress(Exception):
@@ -193,6 +194,23 @@ class TTS(tts.TTS):
     def _ensure_warm(self) -> None:
         if self._warm_task is None:
             self._warm_task = asyncio.create_task(self._open_stream_conn())
+            self._warm_task.add_done_callback(self._watch_warm)
+
+    def _watch_warm(self, task: asyncio.Task[_StreamConn]) -> None:
+        # if the warm socket drops while idle, reopen it so the next call
+        # never pays the handshake on the hot path
+        if task.cancelled() or task.exception():
+            return
+        warm = task.result()
+
+        async def _watch() -> None:
+            with contextlib.suppress(Exception):
+                await warm.conn.websocket.wait_closed()
+            if self._warm_task is task:  # still unconsumed and it died -> rewarm
+                self._warm_task = None
+                self._ensure_warm()
+
+        warm._watcher = asyncio.create_task(_watch())
 
     async def _acquire_stream_conn(self) -> _StreamConn:
         # hand off the prewarmed conn and immediately start opening the next one, so the
