@@ -19,6 +19,7 @@ import base64
 import contextlib
 import weakref
 from dataclasses import dataclass, replace
+from typing import Any
 
 from deepdub import DeepdubClient  # type: ignore[import-untyped]
 from livekit.agents import (
@@ -46,6 +47,20 @@ AUDIO_FORMAT = "s16le"
 # this long for more before treating the stream as complete.
 # ponytail: grace timeout; a distinct terminal signal from the server would remove it.
 STREAM_END_GRACE = 1.0
+
+
+class _StreamConn:
+    """A single-use streaming connection, opened (connect + status) ahead of time so the
+    ~1s handshake is off the hot path. Still one connection per call: used once, then closed.
+    """
+
+    def __init__(self, cm: Any, conn: DeepdubClient) -> None:
+        self._cm = cm
+        self.conn = conn
+
+    async def aclose(self) -> None:
+        with contextlib.suppress(Exception):
+            await self._cm.__aexit__(None, None, None)
 
 
 @dataclass
@@ -160,6 +175,41 @@ class TTS(tts.TTS):
             accent_ratio=accent_ratio,
         )
         self._streams = weakref.WeakSet[SynthesizeStream]()
+        self._warm_task: asyncio.Task[_StreamConn] | None = None
+
+    async def _open_stream_conn(self) -> _StreamConn:
+        # connect + read the initial status so the socket is ready for stream-config
+        cm = self._client.async_connect(streaming_input=True)
+        conn: DeepdubClient = await cm.__aenter__()
+        try:
+            status = await conn._stream_recv_json()
+            if status and status.get("action") == "error":
+                raise APIError(f"Deepdub connection failed: {status.get('message')}")
+        except BaseException:
+            await cm.__aexit__(None, None, None)
+            raise
+        return _StreamConn(cm, conn)
+
+    def _ensure_warm(self) -> None:
+        if self._warm_task is None:
+            self._warm_task = asyncio.create_task(self._open_stream_conn())
+
+    async def _acquire_stream_conn(self) -> _StreamConn:
+        # hand off the prewarmed conn and immediately start opening the next one, so the
+        # handshake stays off the hot path while each call still gets its own connection
+        self._ensure_warm()
+        assert self._warm_task is not None
+        task = self._warm_task
+        self._warm_task = None
+        self._ensure_warm()
+        try:
+            return await task
+        except Exception:
+            # prewarm failed (e.g. idle socket dropped); open fresh on the hot path
+            return await self._open_stream_conn()
+
+    def prewarm(self) -> None:
+        self._ensure_warm()
 
     @property
     def model(self) -> str:
@@ -218,6 +268,12 @@ class TTS(tts.TTS):
         for stream in list(self._streams):
             await stream.aclose()
         self._streams.clear()
+        if self._warm_task is not None:
+            self._warm_task.cancel()
+            with contextlib.suppress(BaseException):
+                warm = await self._warm_task
+                await warm.aclose()
+            self._warm_task = None
 
 
 class ChunkedStream(tts.ChunkedStream):
@@ -331,8 +387,12 @@ class SynthesizeStream(tts.SynthesizeStream):
                 if resp.get("isFinished"):
                     generation_finished = True
 
+        stream_conn: _StreamConn | None = None
         try:
-            async with self._tts._client.async_stream_connect(
+            # prewarmed: handshake already done off the hot path; config is sent per-call
+            stream_conn = await self._tts._acquire_stream_conn()
+            conn = stream_conn.conn
+            await conn.async_stream_config(
                 model=opts.model,
                 locale=opts.locale,
                 voice_prompt_id=opts.voice_prompt_id,
@@ -340,22 +400,25 @@ class SynthesizeStream(tts.SynthesizeStream):
                 sample_rate=opts.sample_rate,
                 accept_emojis=opts.accept_emojis,
                 realtime=opts.realtime,
-            ) as conn:
-                tasks = [
-                    asyncio.create_task(_input_task(conn)),
-                    asyncio.create_task(_recv_task(conn)),
-                ]
-                try:
-                    await asyncio.gather(*tasks)
-                except asyncio.CancelledError:
-                    # interrupted mid-generation: tell the server to stop
-                    with contextlib.suppress(Exception):
-                        await conn.async_stream_cancel()
-                    raise
-                finally:
-                    input_started.set()
-                    await utils.aio.gracefully_cancel(*tasks)
+            )
+            tasks = [
+                asyncio.create_task(_input_task(conn)),
+                asyncio.create_task(_recv_task(conn)),
+            ]
+            try:
+                await asyncio.gather(*tasks)
+            except asyncio.CancelledError:
+                # interrupted mid-generation: tell the server to stop
+                with contextlib.suppress(Exception):
+                    await conn.async_stream_cancel()
+                raise
+            finally:
+                input_started.set()
+                await utils.aio.gracefully_cancel(*tasks)
         except (APIError, APITimeoutError, asyncio.CancelledError):
             raise
         except Exception as e:
             raise APIConnectionError() from e
+        finally:
+            if stream_conn is not None:
+                await stream_conn.aclose()
