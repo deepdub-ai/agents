@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import contextlib
 import json
 import os
 import uuid
@@ -190,14 +191,6 @@ class TTS(tts.TTS):
             or DEFAULT_STREAMING_URL,
         )
         self._session = http_session
-        # pool the streaming socket so the ~1s WS handshake happens off the hot path
-        # (prewarmed/reused) instead of inside every reply's _run
-        self._pool = utils.ConnectionPool[aiohttp.ClientWebSocketResponse](
-            connect_cb=self._connect_stream_ws,
-            close_cb=self._close_ws,
-            max_session_duration=300,
-            mark_refreshed_on_get=True,
-        )
         self._streams = weakref.WeakSet[SynthesizeStream]()
 
     @property
@@ -222,8 +215,7 @@ class TTS(tts.TTS):
         )
 
     async def _connect_stream_ws(self, timeout: float) -> aiohttp.ClientWebSocketResponse:
-        # pool connect_cb: connect and consume the initial status so a pooled socket
-        # is ready to receive stream-config immediately
+        # connect and consume the initial status so the socket is ready for stream-config
         ws = await self._connect_ws(self._opts.streaming_url, timeout)
         initial_msg = await ws.receive(timeout=timeout)
         if initial_msg.type not in (aiohttp.WSMsgType.TEXT, aiohttp.WSMsgType.BINARY):
@@ -238,12 +230,6 @@ class TTS(tts.TTS):
             extra={"deepdub_connection_id": status.get("connectionId")},
         )
         return ws
-
-    async def _close_ws(self, ws: aiohttp.ClientWebSocketResponse) -> None:
-        await ws.close()
-
-    def prewarm(self) -> None:
-        self._pool.prewarm()
 
     def update_options(
         self,
@@ -308,7 +294,6 @@ class TTS(tts.TTS):
             await stream.aclose()
 
         self._streams.clear()
-        await self._pool.aclose()
 
 
 class ChunkedStream(tts.ChunkedStream):
@@ -505,21 +490,27 @@ class SynthesizeStream(tts.SynthesizeStream):
                 "accentControl": self._opts.accent_control(),
             },
         }
+        ws: aiohttp.ClientWebSocketResponse | None = None
         try:
-            # pooled: connection + initial status already done, off the hot path
-            async with self._tts._pool.connection(timeout=self._conn_options.timeout) as ws:
-                await ws.send_str(json.dumps(config_pkt))
+            # one connection per call; the streaming session owns its own lifecycle
+            ws = await self._tts._connect_stream_ws(self._conn_options.timeout)
+            await ws.send_str(json.dumps(config_pkt))
 
-                tasks = [
-                    asyncio.create_task(_input_task(ws)),
-                    asyncio.create_task(_recv_task(ws)),
-                ]
-
-                try:
-                    await asyncio.gather(*tasks)
-                finally:
-                    input_sent_event.set()
-                    await utils.aio.gracefully_cancel(*tasks)
+            tasks = [
+                asyncio.create_task(_input_task(ws)),
+                asyncio.create_task(_recv_task(ws)),
+            ]
+            try:
+                await asyncio.gather(*tasks)
+            except asyncio.CancelledError:
+                # interrupted mid-generation: tell the server to stop generating.
+                # cancellation has already been delivered once, so this await runs.
+                with contextlib.suppress(Exception):
+                    await ws.send_str(json.dumps({"action": "cancel"}))
+                raise
+            finally:
+                input_sent_event.set()
+                await utils.aio.gracefully_cancel(*tasks)
         except asyncio.TimeoutError:
             raise APITimeoutError() from None
         except aiohttp.ClientResponseError as e:
@@ -528,5 +519,10 @@ class SynthesizeStream(tts.SynthesizeStream):
             ) from None
         except APIError:
             raise
+        except asyncio.CancelledError:
+            raise
         except Exception as e:
             raise APIConnectionError() from e
+        finally:
+            if ws is not None:
+                await ws.close()
