@@ -21,7 +21,7 @@ classifiers = [
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3 :: Only",
 ]
-dependencies = ["livekit-agents>=1.5.19.rc1"]
+dependencies = ["livekit-agents>=1.5.19.rc1", "deepdub>=0.1.28"]
 
 [project.urls]
 Documentation = "https://docs.livekit.io"
@@ -39,4 +39,4 @@ include = ["/livekit"]
 
 [tool.uv]
 exclude-newer = "7 days"
-exclude-newer-package = { livekit-agents = "0 days" }
+exclude-newer-package = { livekit-agents = "0 days", deepdub = "0 days" }
