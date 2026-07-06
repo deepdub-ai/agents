@@ -190,6 +190,14 @@ class TTS(tts.TTS):
             or DEFAULT_STREAMING_URL,
         )
         self._session = http_session
+        # pool the streaming socket so the ~1s WS handshake happens off the hot path
+        # (prewarmed/reused) instead of inside every reply's _run
+        self._pool = utils.ConnectionPool[aiohttp.ClientWebSocketResponse](
+            connect_cb=self._connect_stream_ws,
+            close_cb=self._close_ws,
+            max_session_duration=300,
+            mark_refreshed_on_get=True,
+        )
         self._streams = weakref.WeakSet[SynthesizeStream]()
 
     @property
@@ -212,6 +220,30 @@ class TTS(tts.TTS):
             session.ws_connect(url, headers={API_AUTH_HEADER: self._opts.api_key}),
             timeout,
         )
+
+    async def _connect_stream_ws(self, timeout: float) -> aiohttp.ClientWebSocketResponse:
+        # pool connect_cb: connect and consume the initial status so a pooled socket
+        # is ready to receive stream-config immediately
+        ws = await self._connect_ws(self._opts.streaming_url, timeout)
+        initial_msg = await ws.receive(timeout=timeout)
+        if initial_msg.type not in (aiohttp.WSMsgType.TEXT, aiohttp.WSMsgType.BINARY):
+            await ws.close()
+            raise APIConnectionError("Deepdub connection closed before the initial status message")
+        status = json.loads(initial_msg.data)
+        if status.get("action") == "error":
+            await ws.close()
+            raise APIError(f"Deepdub connection failed: {status.get('message')}")
+        logger.debug(
+            "established new Deepdub streaming connection",
+            extra={"deepdub_connection_id": status.get("connectionId")},
+        )
+        return ws
+
+    async def _close_ws(self, ws: aiohttp.ClientWebSocketResponse) -> None:
+        await ws.close()
+
+    def prewarm(self) -> None:
+        self._pool.prewarm()
 
     def update_options(
         self,
@@ -276,6 +308,7 @@ class TTS(tts.TTS):
             await stream.aclose()
 
         self._streams.clear()
+        await self._pool.aclose()
 
 
 class ChunkedStream(tts.ChunkedStream):
@@ -455,58 +488,38 @@ class SynthesizeStream(tts.SynthesizeStream):
                 if data.get("isFinished"):
                     generation_finished = True
 
-        ws: aiohttp.ClientWebSocketResponse | None = None
+        config_pkt = {
+            "action": "stream-config",
+            "config": {
+                "model": self._opts.model,
+                "locale": self._opts.locale,
+                "voicePromptId": self._opts.voice_prompt_id,
+                "format": AUDIO_FORMAT,
+                "sampleRate": self._opts.sample_rate,
+                "acceptEmojis": self._opts.accept_emojis,
+                "temperature": self._opts.temperature,
+                "variance": self._opts.variance,
+                "tempo": self._opts.tempo,
+                "promptBoost": self._opts.prompt_boost,
+                "realtime": self._opts.realtime,
+                "accentControl": self._opts.accent_control(),
+            },
+        }
         try:
-            ws = await self._tts._connect_ws(self._opts.streaming_url, self._conn_options.timeout)
+            # pooled: connection + initial status already done, off the hot path
+            async with self._tts._pool.connection(timeout=self._conn_options.timeout) as ws:
+                await ws.send_str(json.dumps(config_pkt))
 
-            # the server sends an initial status message before accepting configuration
-            initial_msg = await ws.receive(timeout=self._conn_options.timeout)
-            if initial_msg.type not in (aiohttp.WSMsgType.TEXT, aiohttp.WSMsgType.BINARY):
-                raise APIStatusError(
-                    "Deepdub connection closed before the initial status message",
-                    request_id=request_id,
-                    status_code=ws.close_code or -1,
-                    body=f"{initial_msg.data=} {initial_msg.extra=}",
-                )
+                tasks = [
+                    asyncio.create_task(_input_task(ws)),
+                    asyncio.create_task(_recv_task(ws)),
+                ]
 
-            status = json.loads(initial_msg.data)
-            if status.get("action") == "error":
-                raise APIError(f"Deepdub connection failed: {status.get('message')}")
-
-            logger.debug(
-                "established new Deepdub streaming connection",
-                extra={"deepdub_connection_id": status.get("connectionId")},
-            )
-
-            config_pkt = {
-                "action": "stream-config",
-                "config": {
-                    "model": self._opts.model,
-                    "locale": self._opts.locale,
-                    "voicePromptId": self._opts.voice_prompt_id,
-                    "format": AUDIO_FORMAT,
-                    "sampleRate": self._opts.sample_rate,
-                    "acceptEmojis": self._opts.accept_emojis,
-                    "temperature": self._opts.temperature,
-                    "variance": self._opts.variance,
-                    "tempo": self._opts.tempo,
-                    "promptBoost": self._opts.prompt_boost,
-                    "realtime": self._opts.realtime,
-                    "accentControl": self._opts.accent_control(),
-                },
-            }
-            await ws.send_str(json.dumps(config_pkt))
-
-            tasks = [
-                asyncio.create_task(_input_task(ws)),
-                asyncio.create_task(_recv_task(ws)),
-            ]
-
-            try:
-                await asyncio.gather(*tasks)
-            finally:
-                input_sent_event.set()
-                await utils.aio.gracefully_cancel(*tasks)
+                try:
+                    await asyncio.gather(*tasks)
+                finally:
+                    input_sent_event.set()
+                    await utils.aio.gracefully_cancel(*tasks)
         except asyncio.TimeoutError:
             raise APITimeoutError() from None
         except aiohttp.ClientResponseError as e:
@@ -517,6 +530,3 @@ class SynthesizeStream(tts.SynthesizeStream):
             raise
         except Exception as e:
             raise APIConnectionError() from e
-        finally:
-            if ws is not None:
-                await ws.close()
